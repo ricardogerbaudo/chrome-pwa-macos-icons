@@ -1,0 +1,21 @@
+{
+  "fill-specializations" : [
+    { "value" : { "solid" : "srgb:1.00000,1.00000,1.00000,1.00000" } },
+    { "appearance" : "dark", "value" : { "solid" : "srgb:0.14902,0.14902,0.16471,1.00000" } }
+  ],
+  "groups" : [
+    {
+      "name" : "Badge",
+      "layers" : [ { "name" : "badge", "image-name" : "badge.png", "glass" : false, "fill" : "none" } ],
+      "shadow" : { "kind" : "neutral", "opacity" : 0.5 },
+      "translucency" : { "enabled" : false, "value" : 0 }
+    },
+    {
+      "name" : "App",
+      "layers" : [ { "name" : "app", "image-name" : "app.png", "glass" : false, "fill" : "none" } ],
+      "shadow" : { "kind" : "none", "opacity" : 0 },
+      "translucency" : { "enabled" : false, "value" : 0 }
+    }
+  ],
+  "supported-platforms" : { "squares" : [ "macOS" ] }
+}

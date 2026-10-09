@@ -1,0 +1,169 @@
+#!/bin/zsh
+# pwa-icons: adaptive (light/dark) icons for Chrome PWAs on macOS.
+#
+# Chrome generates an ad-hoc signed app shim for each installed PWA. This tool
+# compiles an Icon Composer document (.icon) into an asset catalog, injects it
+# into the shim, re-signs it ad hoc and keeps it there: a LaunchAgent re-applies
+# the icon whenever Chrome recreates the shim.
+
+set -euo pipefail
+
+SELF=${0:A}
+STATE="$HOME/Library/Application Support/pwa-icons"
+APPS="$STATE/apps"
+CHROME_APPS="${PWA_ICONS_CHROME_APPS:-$HOME/Applications/Chrome Apps.localized}"
+LABEL="local.pwa-icons"
+AGENT="$HOME/Library/LaunchAgents/$LABEL.plist"
+LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+ICON_NAME=PWAIcon
+
+usage() {
+  cat <<USAGE
+Usage:
+  pwa-icons add <app name> <icon.icon>   Compile the icon and install it on the PWA
+  pwa-icons remove <app name>            Restore the PWA's original icon
+  pwa-icons list                         List managed PWAs
+  pwa-icons apply                        Re-apply all icons (run by the LaunchAgent)
+
+<app name> is the shim's name in "$CHROME_APPS", without ".app".
+USAGE
+}
+
+die() { print -u2 "pwa-icons: $*"; exit 1; }
+log() { print "$(date '+%Y-%m-%d %H:%M:%S') $*"; }
+
+shim_path() { print -r -- "$CHROME_APPS/$1.app"; }
+
+actool() {
+  if ! xcrun --find actool &>/dev/null; then
+    [[ -d /Applications/Xcode.app ]] || die "actool not found: install Xcode (only needed to compile icons)"
+    export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+  fi
+  xcrun actool "$@"
+}
+
+# Injects the compiled icon into one shim. No-op when it is already there.
+apply_one() {
+  local name=$1 src="$APPS/$1"
+  local app=$(shim_path "$name")
+  local res="$app/Contents/Resources" plist="$app/Contents/Info.plist"
+  [[ -d "$app" ]] || return 0
+
+  if cmp -s "$src/Assets.car" "$res/Assets.car" &&
+     [[ "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIconName' "$plist" 2>/dev/null)" == $ICON_NAME ]]; then
+    return 0
+  fi
+
+  cp "$src/Assets.car" "$src/$ICON_NAME.icns" "$res/"
+  /usr/libexec/PlistBuddy -c 'Delete :CFBundleIconName' "$plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :CFBundleIconName string $ICON_NAME" -c "Set :CFBundleIconFile $ICON_NAME" "$plist"
+  # A custom Finder icon would take precedence over the bundle's icon.
+  rm -f "$app/Icon"$'\r'
+  xattr -d com.apple.FinderInfo "$app" 2>/dev/null || true
+  codesign --force --sign - --preserve-metadata=identifier,entitlements,flags,runtime "$app" 2>/dev/null
+  "$LSREGISTER" -f "$app"
+  log "applied icon to $name"
+  return 1
+}
+
+cmd_apply() {
+  local changed=0 dir
+  for dir in "$APPS"/*(N/); do
+    apply_one "${dir:t}" || changed=1
+  done
+  # The Dock caches icons of running apps; it only needs a restart after Chrome recreated a shim.
+  (( changed )) && killall Dock || true
+}
+
+write_agent() {
+  local dirs=("$APPS"/*(N/))
+  if (( ${#dirs} == 0 )); then
+    launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+    rm -f "$AGENT"
+    return
+  fi
+
+  local paths="    <string>$CHROME_APPS</string>" dir
+  for dir in $dirs; do
+    paths+=$'\n'"    <string>$(shim_path "${dir:t}")/Contents/Info.plist</string>"
+  done
+
+  mkdir -p "${AGENT:h}"
+  cat > "$AGENT" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$STATE/pwa-icons</string>
+    <string>apply</string>
+  </array>
+  <key>WatchPaths</key>
+  <array>
+$paths
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>StandardOutPath</key><string>$STATE/log.txt</string>
+  <key>StandardErrorPath</key><string>$STATE/log.txt</string>
+</dict>
+</plist>
+PLIST
+  launchctl bootout "gui/$UID/$LABEL" 2>/dev/null || true
+  launchctl bootstrap "gui/$UID" "$AGENT"
+}
+
+cmd_add() {
+  (( $# == 2 )) || { usage; exit 1; }
+  local name=$1 icon=${2:A}
+  [[ -d "$(shim_path "$name")" ]] || die "PWA not found: $(shim_path "$name")"
+  [[ -f "$icon/icon.json" ]] || die "not an Icon Composer document: $icon"
+
+  local tmp=$(mktemp -d)
+  trap "rm -rf '$tmp'" EXIT
+  cp -R "$icon" "$tmp/$ICON_NAME.icon"
+  actool "$tmp/$ICON_NAME.icon" --compile "$tmp" --platform macosx \
+    --minimum-deployment-target 13.0 --app-icon $ICON_NAME \
+    --output-partial-info-plist "$tmp/partial.plist" >/dev/null
+
+  mkdir -p "$APPS/$name"
+  cp "$tmp/Assets.car" "$tmp/$ICON_NAME.icns" "$APPS/$name/"
+  # The LaunchAgent runs this copy, so the repository can be moved or deleted.
+  cp "$SELF" "$STATE/pwa-icons"
+  # Apply before (re)loading the agent so both don't re-sign the shim at the same time.
+  cmd_apply
+  write_agent
+}
+
+cmd_remove() {
+  (( $# == 1 )) || { usage; exit 1; }
+  local name=$1 app=$(shim_path "$1")
+  [[ -d "$APPS/$name" ]] || die "not managed: $name"
+  rm -rf "$APPS/$name"
+  write_agent
+
+  if [[ -d "$app" ]]; then
+    local plist="$app/Contents/Info.plist"
+    rm -f "$app/Contents/Resources/Assets.car" "$app/Contents/Resources/$ICON_NAME.icns"
+    /usr/libexec/PlistBuddy -c 'Delete :CFBundleIconName' "$plist" 2>/dev/null || true
+    /usr/libexec/PlistBuddy -c 'Set :CFBundleIconFile app.icns' "$plist"
+    codesign --force --sign - --preserve-metadata=identifier,entitlements,flags,runtime "$app" 2>/dev/null
+    "$LSREGISTER" -f "$app"
+    killall Dock
+  fi
+  log "restored original icon of $name"
+}
+
+cmd_list() {
+  local dir
+  for dir in "$APPS"/*(N/); do print -r -- "${dir:t}"; done
+}
+
+case "${1:-}" in
+  add)    shift; cmd_add "$@" ;;
+  remove) shift; cmd_remove "$@" ;;
+  list)   cmd_list ;;
+  apply)  cmd_apply ;;
+  *)      usage; exit 1 ;;
+esac

@@ -1,0 +1,8 @@
+# Icons are usually branded artwork: keep them out of the repository.
+# Only the neutral example is versioned.
+*.icon/
+*.car
+*.icns
+!example/*.icon/
+
+.DS_Store
